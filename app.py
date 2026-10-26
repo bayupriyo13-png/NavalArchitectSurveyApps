@@ -105,8 +105,8 @@ GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 def konfigurasi_drive() -> tuple[dict | None, str, str | None]:
     """Membaca konfigurasi private Drive dari environment tanpa mengekspos kredensial."""
-    folder_id = os.getenv("GOOGLE_DRIVE_RULES_FOLDER_ID", GOOGLE_DRIVE_FOLDER_ID_DEFAULT).strip()
-    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    folder_id = ambil_rahasia("GOOGLE_DRIVE_RULES_FOLDER_ID") or GOOGLE_DRIVE_FOLDER_ID_DEFAULT
+    raw_json = ambil_rahasia("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not raw_json:
         return None, folder_id, "GOOGLE_SERVICE_ACCOUNT_JSON belum dikonfigurasi."
     try:
@@ -742,8 +742,20 @@ def analisis_dokumen(
 
 
 def ambil_api_key() -> str | None:
-    """Mengambil key dari environment variable sistem, tanpa menampilkannya di UI."""
-    return os.getenv("GEMINI_API_KEY")
+    """Mengambil API key dari environment atau Streamlit Secrets tanpa menampilkannya di UI."""
+    return ambil_rahasia("GEMINI_API_KEY") or None
+
+
+def ambil_rahasia(nama: str) -> str:
+    """Environment diprioritaskan; Streamlit Secrets dipakai untuk deployment Community Cloud."""
+    nilai = os.getenv(nama, "").strip()
+    if nilai:
+        return nilai
+    try:
+        nilai_secret = st.secrets.get(nama, "")
+    except Exception:
+        return ""
+    return str(nilai_secret).strip()
 
 
 # ---------------------------------------------------------------------------
