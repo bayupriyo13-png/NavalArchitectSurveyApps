@@ -1,0 +1,13 @@
+# Credentials and deployment secrets
+.env
+.streamlit/secrets.toml
+service-account*.json
+*.json
+
+# Private standards are sourced from Google Drive, not Git
+*.pdf
+
+# Generated or local-only files
+__pycache__/
+work/
+~$*
