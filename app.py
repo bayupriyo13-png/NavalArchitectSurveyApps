@@ -891,9 +891,9 @@ render_html(
     dari lambung hingga jalur evakuasi, dalam satu panel kendali.</p>
     <div class="hero-chips">
     <span class="chip">ENGINE <b>GEMINI 3.8 FLASH</b></span>
-    <span class="chip">STANDAR <b>BKI · NCVS · HSC · TRADISIONAL · KLM</b></span>
+    <span class="chip">STANDAR <b>NCVS · HSC · TRADISIONAL · KLM</b></span>
     <span class="chip">SCOPE <b>GA · LSA · FCP</b></span>
-    <span class="chip">OUTPUT <b>MARKDOWN REPORT</b></span>
+    <span class="chip">OUTPUT <b>PDF REPORT</b></span>
     </div>
     {SHIP_SVG}
     </div>
