@@ -106,16 +106,48 @@ GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 def konfigurasi_drive() -> tuple[dict | None, str, str | None]:
     """Membaca konfigurasi private Drive dari environment tanpa mengekspos kredensial."""
     folder_id = ambil_rahasia("GOOGLE_DRIVE_RULES_FOLDER_ID") or GOOGLE_DRIVE_FOLDER_ID_DEFAULT
-    raw_json = ambil_rahasia("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not raw_json:
+    info = _baca_service_account()
+    if info is None:
         return None, folder_id, "GOOGLE_SERVICE_ACCOUNT_JSON belum dikonfigurasi."
-    try:
-        info = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return None, folder_id, "GOOGLE_SERVICE_ACCOUNT_JSON bukan JSON Service Account yang valid."
-    if not isinstance(info, dict) or not info.get("client_email") or not info.get("private_key"):
+    if isinstance(info, str):
+        return None, folder_id, (
+            "GOOGLE_SERVICE_ACCOUNT_JSON bukan JSON Service Account yang valid "
+            f"({info}). Salin ulang seluruh isi file JSON dari Google Cloud ke Secrets."
+        )
+    if not info.get("client_email") or not info.get("private_key"):
         return None, folder_id, "JSON Service Account tidak memuat client_email atau private_key."
+    # Kunci yang ditempel dengan "\n" literal (dua karakter) harus menjadi baris baru asli.
+    info["private_key"] = str(info["private_key"]).replace("\\n", "\n")
     return info, folder_id, None
+
+
+def _baca_service_account() -> dict | str | None:
+    """Membaca Service Account dari environment atau Streamlit Secrets dalam berbagai format.
+
+    Mengembalikan dict bila berhasil, None bila tidak ada, atau teks alasan bila tidak valid.
+    Format yang diterima:
+    - string JSON, termasuk yang dibungkus kutip tiga ganda di secrets.toml (TOML mengubah
+      "\\n" di private_key menjadi baris baru asli, sehingga JSON perlu dibaca dengan strict=False);
+    - tabel TOML [GOOGLE_SERVICE_ACCOUNT_JSON] berisi field Service Account.
+    """
+    nama = "GOOGLE_SERVICE_ACCOUNT_JSON"
+    nilai = os.getenv(nama, "").strip() or None
+    if nilai is None:
+        try:
+            nilai = st.secrets.get(nama)
+        except Exception:
+            nilai = None
+    if not nilai:
+        return None
+    if hasattr(nilai, "keys"):  # tabel TOML
+        return {str(k): v for k, v in dict(nilai).items()}
+    try:
+        info = json.loads(str(nilai).strip(), strict=False)
+    except json.JSONDecodeError as error:
+        return f"baris {error.lineno}, kolom {error.colno}: {error.msg}"
+    if not isinstance(info, dict):
+        return "isi bukan objek JSON"
+    return info
 
 
 def _layanan_drive():
