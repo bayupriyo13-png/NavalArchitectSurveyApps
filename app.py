@@ -2,7 +2,7 @@
 Naval Architect Survey Apps — Futuristic Edition
 
 Instalasi:
-    pip install streamlit google-genai reportlab
+    pip install -r requirements.txt
 
 Menjalankan aplikasi:
     streamlit run app.py
@@ -13,8 +13,10 @@ Catatan:
   * rules dasar.pdf atau rules_dasar.pdf -> dipakai pada SETIAP analisis (wajib ada).
   * PDF aturan per standar -> hanya dipakai bila standarnya dipilih. Lihat
     NAMA_FILE_STANDAR di bawah untuk nama file yang digunakan.
-- Environment deployment yang wajib: GEMINI_API_KEY dan GOOGLE_SERVICE_ACCOUNT_JSON.
+- Environment deployment yang wajib: ANTHROPIC_API_KEY dan GOOGLE_SERVICE_ACCOUNT_JSON.
   GOOGLE_DRIVE_RULES_FOLDER_ID bersifat opsional; default memakai folder yang dikonfigurasi aplikasi.
+- PDF dikirim ke Claude lewat Files API. PDF aturan diunggah sekali per versi Drive dan dipakai
+  ulang; dokumen utama pengguna diunggah per analisis lalu dihapus.
 """
 
 import html as htmllib
@@ -28,9 +30,15 @@ from collections.abc import Callable
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import anthropic
 import streamlit as st
-from google import genai
-from google.genai import types
+
+try:
+    from pypdf import PdfReader
+
+    PYPDF_TERSEDIA = True
+except ImportError:
+    PYPDF_TERSEDIA = False
 
 try:
     from google.oauth2 import service_account
@@ -97,7 +105,10 @@ NAMA_FILE_STANDAR = {
 NAMA_ATURAN_DASAR = "rules_dasar.pdf"
 NAMA_FILE_ATURAN_DASAR = ("rules_dasar.pdf", "rules dasar.pdf")
 MAX_TOTAL_PDF_MB = 50
-MODEL_GEMINI = "gemini-3.8-flash"
+MODEL_CLAUDE = "claude-opus-5-5"
+EFFORT_CLAUDE = "high"
+MAKS_TOKEN_KELUARAN = 32000
+MAKS_HALAMAN_PDF = 600  # batas halaman PDF per permintaan Claude
 MAKS_PERCOBAAN_ANALISIS = 3
 GOOGLE_DRIVE_FOLDER_ID_DEFAULT = "150i6xh0X7JX_dQOHAKVnTIHY4tYZfwQr"
 GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
@@ -665,10 +676,9 @@ Lakukan hal berikut:
    arrangement keselamatan, dan spesifikasi material.
 6. Perlakukan jenis kapal, LOA, dan GT sebagai data masukan pengguna. Cocokkan dengan
    dokumen bila dapat dilakukan; apabila berbeda atau tidak terbaca, tandai "Perlu verifikasi".
-7. PDF pertama adalah dokumen utama yang diperiksa. PDF setelahnya adalah dokumen aturan/acuan,
-   sesuai urutan pada daftar "Dokumen aturan/acuan" di atas: file aturan dasar adalah aturan
-   yang berlaku untuk SEMUA analisis, sedangkan PDF lainnya adalah aturan khusus untuk
-   standar acuan yang dipilih. Saat menggunakan aturan dari PDF acuan, sebutkan nama dokumen,
+7. Setiap PDF diberi judul. PDF berjudul "DOKUMEN UTAMA" (PDF terakhir) adalah dokumen yang
+   diperiksa. PDF sebelumnya adalah dokumen aturan/acuan: "ATURAN DASAR" berlaku untuk SEMUA
+   analisis, sedangkan "ATURAN STANDAR" adalah aturan khusus untuk standar acuan yang dipilih. Saat menggunakan aturan dari PDF acuan, sebutkan nama dokumen,
    nomor klausul dan halaman bila terbaca. Jika klausul/halaman tidak terbaca, tulis
    "Perlu verifikasi"; jangan mengarang referensi atau menyatakan kepatuhan formal.
 8. Evaluasi HANYA terhadap aturan dasar dan standar acuan yang dipilih di
@@ -692,58 +702,112 @@ persetujuan desain, atau pengganti inspeksi dan perhitungan oleh tenaga berwenan
 """.strip()
 
 
+def hitung_halaman_pdf(data: bytes) -> int | None:
+    """Jumlah halaman PDF, atau None bila tidak dapat dihitung."""
+    if not PYPDF_TERSEDIA:
+        return None
+    try:
+        return len(PdfReader(BytesIO(data)).pages)
+    except Exception:
+        return None
+
+
+@st.cache_resource(show_spinner=False)
+def _klien_claude(api_key: str) -> anthropic.Anthropic:
+    # Retry ditangani sendiri di analisis_dokumen agar status dapat ditampilkan ke pengguna.
+    return anthropic.Anthropic(api_key=api_key, max_retries=0, timeout=900.0)
+
+
+@st.cache_resource(show_spinner=False)
+def file_id_aturan(api_key: str, drive_file_id: str, modified_time: str, nama: str, _data: bytes) -> str:
+    """Mengunggah PDF aturan ke Files API sekali per versi Drive, lalu memakai ulang file_id-nya.
+
+    Nama file memuat ID dan waktu ubah Drive sehingga unggahan lama dapat ditemukan kembali
+    setelah aplikasi dimulai ulang, tanpa menumpuk salinan baru.
+    """
+    client = _klien_claude(api_key)
+    stempel = re.sub(r"[^0-9A-Za-z]", "", modified_time)
+    nama_unggahan = f"rules_{drive_file_id}_{stempel}_{nama}"
+    for berkas in client.files.list(limit=1000):
+        if berkas.filename == nama_unggahan:
+            return berkas.id
+    unggahan = client.files.upload(file=(nama_unggahan, _data, "application/pdf"))
+    return unggahan.id
+
+
+def _blok_dokumen(file_id: str, judul: str) -> dict:
+    return {"type": "document", "source": {"type": "file", "file_id": file_id}, "title": judul}
+
+
 def analisis_dokumen(
     api_key: str,
+    nama_dokumen_pemeriksaan: str,
     data_dokumen_pemeriksaan: bytes,
-    data_dokumen_acuan: list[bytes],
+    aturan: list[tuple[str, str]],
     prompt: str,
     saat_retry: Callable[[int, int, float], None] | None = None,
 ) -> str:
-    client = genai.Client(api_key=api_key)
+    """Menjalankan telaah dengan Claude.
 
-    parts = [
-        types.Part.from_bytes(
-            data=data_dokumen_pemeriksaan,
-            mime_type="application/pdf",
-        )
-    ]
-    parts.extend(
-        types.Part.from_bytes(data=data_pdf, mime_type="application/pdf")
-        for data_pdf in data_dokumen_acuan
+    `aturan` berisi pasangan (file_id Files API, judul). PDF aturan diletakkan paling depan dan
+    ditandai cache_control agar analisis berikutnya dengan aturan yang sama lebih murah.
+    """
+    client = _klien_claude(api_key)
+    dokumen_utama = client.files.upload(
+        file=(nama_dokumen_pemeriksaan, data_dokumen_pemeriksaan, "application/pdf"),
+        expires_in_seconds=86400,  # cadangan bila penghapusan di bawah gagal
     )
-    parts.append(prompt)
+    try:
+        konten: list[dict] = [_blok_dokumen(file_id, judul) for file_id, judul in aturan]
+        if konten:
+            konten[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+        konten.append(_blok_dokumen(dokumen_utama.id, f"DOKUMEN UTAMA: {nama_dokumen_pemeriksaan}"))
+        konten.append({"type": "text", "text": prompt})
 
-    for percobaan in range(MAKS_PERCOBAAN_ANALISIS):
+        for percobaan in range(MAKS_PERCOBAAN_ANALISIS):
+            try:
+                with client.beta.messages.stream(
+                    model=MODEL_CLAUDE,
+                    max_tokens=MAKS_TOKEN_KELUARAN,
+                    output_config={"effort": EFFORT_CLAUDE},
+                    betas=["server-side-fallback-2026-07-01"],
+                    fallbacks="default",
+                    messages=[{"role": "user", "content": konten}],
+                ) as stream:
+                    respons = stream.get_final_message()
+                if respons.stop_reason == "refusal":
+                    raise RuntimeError("Claude menolak menganalisis dokumen ini.")
+                teks = "".join(blok.text for blok in respons.content if blok.type == "text").strip()
+                if not teks:
+                    raise RuntimeError("Claude tidak mengembalikan teks analisis.")
+                if respons.stop_reason == "max_tokens":
+                    teks += "\n\n> Catatan: laporan terpotong karena mencapai batas panjang keluaran."
+                return teks
+            except (
+                anthropic.RateLimitError,
+                anthropic.InternalServerError,
+                anthropic.APIConnectionError,
+            ):
+                # InternalServerError mencakup 5xx termasuk 529 overloaded;
+                # APIConnectionError mencakup timeout.
+                if percobaan == MAKS_PERCOBAAN_ANALISIS - 1:
+                    raise
+                # 2, 4 detik + jitter kecil agar klien tidak melakukan retry serentak.
+                jeda = (2**(percobaan + 1)) + random.uniform(0, 0.75)
+                if saat_retry:
+                    saat_retry(percobaan + 1, MAKS_PERCOBAAN_ANALISIS, jeda)
+                time.sleep(jeda)
+        raise RuntimeError("Analisis tidak dapat dijalankan.")
+    finally:
         try:
-            response = client.models.generate_content(
-                model=MODEL_GEMINI,
-                contents=parts,
-            )
-            if not response.text:
-                raise RuntimeError("Gemini tidak mengembalikan teks analisis.")
-            return response.text
-        except Exception as error:
-            pesan = str(error).upper()
-            sementara = any(
-                kode in pesan
-                for kode in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "408", "TIMEOUT")
-            )
-            percobaan_terakhir = percobaan == MAKS_PERCOBAAN_ANALISIS - 1
-            if not sementara or percobaan_terakhir:
-                raise
-
-            # 2, 4 detik + jitter kecil agar klien tidak melakukan retry serentak.
-            jeda = (2**(percobaan + 1)) + random.uniform(0, 0.75)
-            if saat_retry:
-                saat_retry(percobaan + 1, MAKS_PERCOBAAN_ANALISIS, jeda)
-            time.sleep(jeda)
-
-    raise RuntimeError("Analisis tidak dapat dijalankan.")
+            client.files.delete(dokumen_utama.id)
+        except anthropic.APIError:
+            pass
 
 
 def ambil_api_key() -> str | None:
     """Mengambil API key dari environment atau Streamlit Secrets tanpa menampilkannya di UI."""
-    return ambil_rahasia("GEMINI_API_KEY") or None
+    return ambil_rahasia("ANTHROPIC_API_KEY") or None
 
 
 def ambil_rahasia(nama: str) -> str:
@@ -790,7 +854,7 @@ with st.sidebar:
     if api_key:
         st.success("Ready to use", icon="✅")
     else:
-        st.error("Gemini API key belum dikonfigurasi pada sistem web.")
+        st.error("API key Claude belum dikonfigurasi pada sistem web.")
 
     standar_pilihan = st.selectbox(
         "Standar acuan evaluasi",
@@ -857,7 +921,7 @@ render_html(
     <p>Telaah awal General Arrangement, LSA Plan, dan Fire Control Plan berbasis AI —
     dari lambung hingga jalur evakuasi, dalam satu panel kendali.</p>
     <div class="hero-chips">
-    <span class="chip">ENGINE <b>GEMINI 3.8 FLASH</b></span>
+    <span class="chip">ENGINE <b>CLAUDE OPUS 5.5</b></span>
     <span class="chip">STANDAR <b>BKI · NCVS · HSC · TRADISIONAL · KLM</b></span>
     <span class="chip">SCOPE <b>GA · LSA · FCP</b></span>
     <span class="chip">OUTPUT <b>MARKDOWN REPORT</b></span>
@@ -955,7 +1019,7 @@ judul_seksi("Jalankan Analisis")
 
 if st.button("🔍 Analisis Rancang Bangun", type="primary", use_container_width=True):
     if not api_key:
-        st.warning("Gemini API key belum dikonfigurasi pada sistem. Hubungi administrator.")
+        st.warning("API key Claude belum dikonfigurasi pada sistem. Hubungi administrator.")
     elif data_pdf is None:
         st.warning("Unggah dokumen PDF rancang bangun, LSA Plan, atau Fire Control Plan terlebih dahulu.")
     elif not aturan_lengkap:
@@ -989,7 +1053,7 @@ if st.button("🔍 Analisis Rancang Bangun", type="primary", use_container_width
 
             def tampilkan_status_retry(percobaan_gagal: int, total: int, jeda: float) -> None:
                 status_retry.warning(
-                    "Layanan Gemini sedang padat. "
+                    "Layanan Claude sedang padat. "
                     f"Percobaan {percobaan_gagal}/{total} gagal; mencoba ulang dalam {jeda:.0f} detik..."
                 )
 
@@ -998,10 +1062,34 @@ if st.button("🔍 Analisis Rancang Bangun", type="primary", use_container_width
                     unduh_pdf_drive(str(file["id"]), str(file.get("modifiedTime", "")))
                     for file in ATURAN_DRIVE
                 ]
+
+                halaman = [hitung_halaman_pdf(data_pdf), *(hitung_halaman_pdf(d) for d in DATA_ATURAN)]
+                total_halaman = sum(h for h in halaman if h)
+                if total_halaman > MAKS_HALAMAN_PDF:
+                    raise ValueError(
+                        f"Total {total_halaman} halaman (dokumen utama + aturan) melebihi batas "
+                        f"{MAKS_HALAMAN_PDF} halaman per analisis. Gunakan dokumen utama yang lebih "
+                        "ringkas atau hanya halaman yang relevan."
+                    )
+
+                aturan_claude = []
+                for file, data in zip(ATURAN_DRIVE, DATA_ATURAN):
+                    nama = str(file["name"])
+                    jenis = (
+                        "ATURAN DASAR"
+                        if nama.casefold() in {n.casefold() for n in NAMA_FILE_ATURAN_DASAR}
+                        else "ATURAN STANDAR"
+                    )
+                    file_id = file_id_aturan(
+                        api_key, str(file["id"]), str(file.get("modifiedTime", "")), nama, data
+                    )
+                    aturan_claude.append((file_id, f"{jenis}: {nama}"))
+
                 hasil = analisis_dokumen(
                     api_key,
+                    unggahan.name,
                     data_pdf,
-                    DATA_ATURAN,
+                    aturan_claude,
                     prompt,
                     saat_retry=tampilkan_status_retry,
                 )
@@ -1009,16 +1097,30 @@ if st.button("🔍 Analisis Rancang Bangun", type="primary", use_container_width
                 st.session_state["hasil_analisis"] = hasil
                 st.session_state["nama_dokumen"] = unggahan.name
                 st.rerun()
-            except Exception as error:
+            except ValueError as error:
                 status_retry.empty()
-                pesan_error = str(error)
-                if "503" in pesan_error or "UNAVAILABLE" in pesan_error.upper():
+                st.error(str(error))
+            except anthropic.AuthenticationError:
+                status_retry.empty()
+                st.error("API key Claude tidak valid. Hubungi administrator.")
+            except (anthropic.RateLimitError, anthropic.InternalServerError, anthropic.APIConnectionError):
+                status_retry.empty()
+                st.error(
+                    "Claude masih padat setelah percobaan ulang otomatis. "
+                    "Tunggu beberapa menit, lalu jalankan analisis kembali."
+                )
+            except anthropic.BadRequestError as error:
+                status_retry.empty()
+                if "too long" in str(error).lower():
                     st.error(
-                        "Gemini masih padat setelah percobaan ulang otomatis. "
-                        "Tunggu beberapa menit, lalu jalankan analisis kembali."
+                        "Dokumen terlalu panjang untuk satu analisis. Gunakan dokumen utama yang "
+                        "lebih ringkas atau hanya halaman yang relevan."
                     )
                 else:
-                    st.error(f"Analisis gagal: {error}")
+                    st.error(f"Analisis gagal: {error.message}")
+            except Exception as error:
+                status_retry.empty()
+                st.error(f"Analisis gagal: {error}")
 
 if "hasil_analisis" in st.session_state:
     judul_seksi("Laporan Hasil Analisis AI")
