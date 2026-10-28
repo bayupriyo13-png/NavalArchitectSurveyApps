@@ -796,7 +796,8 @@ def ambil_rahasia(nama: str) -> str:
 
 render_html(CSS)
 
-_, FOLDER_DRIVE_ID, KESALAHAN_KONFIGURASI_DRIVE = konfigurasi_drive()
+INFO_SERVICE_ACCOUNT, FOLDER_DRIVE_ID, KESALAHAN_KONFIGURASI_DRIVE = konfigurasi_drive()
+EMAIL_SERVICE_ACCOUNT = str((INFO_SERVICE_ACCOUNT or {}).get("client_email", "—"))
 DAFTAR_FILE_DRIVE: list[dict] = []
 KESALAHAN_DRIVE = KESALAHAN_KONFIGURASI_DRIVE
 if KESALAHAN_DRIVE is None:
@@ -967,10 +968,20 @@ render_html(
 if KESALAHAN_DRIVE:
     st.error(KESALAHAN_DRIVE)
 elif not dasar_ok:
-    st.error(
-        "File aturan dasar tidak ditemukan di Google Drive. "
-        "Gunakan nama `rules dasar.pdf` atau `rules_dasar.pdf` pada folder Drive yang dibagikan."
-    )
+    if DAFTAR_FILE_DRIVE:
+        nama_terlihat = ", ".join(f"`{file['name']}`" for file in DAFTAR_FILE_DRIVE)
+        st.error(
+            "File aturan dasar tidak ditemukan di Google Drive. "
+            "Gunakan nama `rules dasar.pdf` atau `rules_dasar.pdf` pada folder Drive yang dibagikan. "
+            f"PDF yang terlihat di folder: {nama_terlihat}."
+        )
+    else:
+        # Drive tidak memberi galat untuk folder yang belum dibagikan; hasilnya hanya kosong.
+        st.error(
+            "Folder Google Drive terlihat kosong bagi aplikasi. Pastikan folder dengan ID "
+            f"`{FOLDER_DRIVE_ID}` berisi PDF aturan dan sudah dibagikan (Viewer) ke "
+            f"`{EMAIL_SERVICE_ACCOUNT}`. Perubahan di Drive terbaca paling lambat 10 menit."
+        )
 elif not standar_ok:
     nama_file = NAMA_FILE_STANDAR[standar_pilihan]
     st.error(
